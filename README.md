@@ -58,7 +58,7 @@ rag-pdf-chatbot/
     chroma/ # vector store (auto-created)
   README.md
 ```
-**[View Performance Benchmarks](BENCHMARKS.md)**
+**[View Performance Benchmarks](rag-pdf-chatbot/BENCHMARKS.md)**
 
 
 ## Notes
