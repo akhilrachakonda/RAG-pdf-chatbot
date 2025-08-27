@@ -58,6 +58,8 @@ rag-pdf-chatbot/
     chroma/ # vector store (auto-created)
   README.md
 ```
+**[View Performance Benchmarks](BENCHMARKS.md)**
+
 
 ## Notes
 - If you don't set an LLM key, the service returns top-k retrieved chunks and a "mock" answer. This still demonstrates RAG.
