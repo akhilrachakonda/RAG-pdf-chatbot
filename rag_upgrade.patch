@@ -1,0 +1,478 @@
+diff --git a/requirements.txt b/requirements.txt
+index 0000000..1111111 100644
+--- a/requirements.txt
++++ b/requirements.txt
+@@ -1,11 +1,24 @@
+-fastapi>=0.103.0
+-uvicorn>=0.23.0
+-pydantic>=2.3.0
+-python-dotenv>=1.0.0
+-langchain>=0.1.0
+-chromadb>=0.4.22
+-sentence-transformers>=2.2.2
+-pypdf>=4.0.0
+-tqdm>=4.66.0
+-numpy>=1.26.0
+-openai>=1.0.0
++fastapi>=0.111.0
++uvicorn>=0.30.0
++pydantic>=2.7.0
++python-dotenv>=1.0.1
++
++langchain>=0.2.3
++langchain-community>=0.2.4
++langchain-text-splitters>=0.0.1
++chromadb>=0.5.0
++
++sentence-transformers>=3.0.0
++pypdf>=4.2.0
++tqdm>=4.66.0
++numpy>=1.26.0
++
++openai>=1.38.0
++
++# Optional retrieval extras (toggle via .env)
++rank-bm25>=0.2.2
++streamlit>=1.36.0
++httpx>=0.27.0
++
++# Dev
++requests>=2.32.2
+diff --git a/.env.example b/.env.example
+new file mode 100644
+index 0000000..2222222
+--- /dev/null
++++ b/.env.example
+@@ -0,0 +1,18 @@
++# Paths
++PDF_DIR=./data/pdfs
++VECTOR_DIR=./data/chroma
++
++# Embeddings & retrieval
++EMBEDDING_MODEL=all-MiniLM-L6-v2
++TOP_K=5
++HYBRID=false
++RERANK=false
++RERANK_MODEL=cross-encoder/ms-marco-MiniLM-L-6-v2
++
++# LLM
++LLM_PROVIDER=openai
++OPENAI_API_KEY=sk-REPLACE_ME
++MODEL_NAME=gpt-4.1-mini
++TEMPERATURE=0.2
++MAX_TOKENS=350
++
+diff --git a/ingest.py b/ingest.py
+index 0000000..3333333 100644
+--- a/ingest.py
++++ b/ingest.py
+@@ -1,99 +1,163 @@
+-# (old ingest)
++import os
++import glob
++from dotenv import load_dotenv
++import chromadb
++from sentence_transformers import SentenceTransformer
++from langchain_community.document_loaders import PyPDFLoader
++from langchain_text_splitters import RecursiveCharacterTextSplitter
++from tqdm import tqdm
++import hashlib
++
++load_dotenv()
++
++PDF_DIR = os.getenv("PDF_DIR", "./data/pdfs")
++VECTOR_DIR = os.getenv("VECTOR_DIR", "./data/chroma")
++EMBEDDING_MODEL = os.getenv("EMBEDDING_MODEL", "all-MiniLM-L6-v2")
++
++def sha16(s: str) -> str:
++    return hashlib.sha256(s.encode("utf-8")).hexdigest()[:16]
++
++def load_and_split(pdf_path: str):
++    loader = PyPDFLoader(pdf_path)
++    pages = loader.load()
++    splitter = RecursiveCharacterTextSplitter(
++        chunk_size=800, chunk_overlap=120, separators=["\n\n", "\n", " ", ""]
++    )
++    docs = splitter.split_documents(pages)
++    for d in docs:
++        text = (d.page_content or "").strip()
++        meta = d.metadata or {}
++        source = os.path.basename(meta.get("source") or pdf_path)
++        page = meta.get("page") or meta.get("page_number")
++        yield {"text": text, "source": source, "page": page}
++
++def main():
++    os.makedirs(PDF_DIR, exist_ok=True)
++    os.makedirs(VECTOR_DIR, exist_ok=True)
++
++    client = chromadb.PersistentClient(path=VECTOR_DIR)
++    col = client.get_or_create_collection(name="pdf_chunks", metadata={"hnsw:space": "cosine"})
++    embedder = SentenceTransformer(EMBEDDING_MODEL)
++
++    pdfs = sorted(glob.glob(os.path.join(PDF_DIR, "*.pdf")))
++    if not pdfs:
++        print(f"No PDFs found in {PDF_DIR}")
++        return
++
++    texts, metas, ids = [], [], []
++    for pdf in pdfs:
++        for c in load_and_split(pdf):
++            if not c["text"]:
++                continue
++            did = sha16(f"{c['source']}|{c['page']}|{c['text'][:200]}")
++            ids.append(did)
++            texts.append(c["text"])
++            metas.append({"source": c["source"], "page": c["page"]})
++
++    print(f"Encoding {len(texts)} chunks with {EMBEDDING_MODEL} ...")
++    embs = embedder.encode(texts, normalize_embeddings=True, batch_size=64, show_progress_bar=True).tolist()
++
++    # Best-effort upsert: delete existing ids then add
++    for i in range(0, len(ids), 1000):
++        try:
++            col.delete(ids=ids[i:i+1000])
++        except Exception:
++            pass
++
++    for i in tqdm(range(0, len(texts), 256), desc="Adding to Chroma"):
++        col.add(
++            ids=ids[i:i+256],
++            documents=texts[i:i+256],
++            embeddings=embs[i:i+256],
++            metadatas=metas[i:i+256],
++        )
++
++    print("Done. Vector store at", VECTOR_DIR)
++
++if __name__ == "__main__":
++    main()
+diff --git a/retriever.py b/retriever.py
+index 0000000..4444444 100644
+--- a/retriever.py
++++ b/retriever.py
+@@ -1,60 +1,187 @@
+-# (old retriever)
++import os
++from typing import List, Dict, Any, Optional
++import chromadb
++from sentence_transformers import SentenceTransformer
++import numpy as np
++from collections import defaultdict
++
++try:
++    from rank_bm25 import BM25Okapi
++except Exception:
++    BM25Okapi = None
++
++class ChromaRetriever:
++    def __init__(self, persist_dir: Optional[str] = None, collection_name: str = "pdf_chunks"):
++        self.persist_dir = persist_dir or os.getenv("VECTOR_DIR", "./data/chroma")
++        self.client = chromadb.PersistentClient(path=self.persist_dir)
++        self.collection = self.client.get_or_create_collection(
++            name=collection_name, metadata={"hnsw:space": "cosine"}
++        )
++        self.embed_model_name = os.getenv("EMBEDDING_MODEL", "all-MiniLM-L6-v2")
++        self.embedder = SentenceTransformer(self.embed_model_name)
++
++        self.top_k = int(os.getenv("TOP_K", "5"))
++        self.hybrid = os.getenv("HYBRID", "false").lower() == "true"
++        self.rerank = os.getenv("RERANK", "false").lower() == "true"
++
++        # Optional BM25 index for HYBRID
++        self.bm25 = None
++        if self.hybrid:
++            if BM25Okapi is None:
++                raise RuntimeError("HYBRID=true requires rank-bm25 (`pip install rank-bm25`).")
++            all_docs = self.collection.get(include=["documents", "metadatas", "ids"], limit=100000)
++            self._bm25_ids = all_docs.get("ids", []) or []
++            self._bm25_docs = all_docs.get("documents", []) or []
++            self._bm25_metas = all_docs.get("metadatas", []) or []
++            tokenized = [ (doc or "").split() for doc in self._bm25_docs ]
++            self.bm25 = BM25Okapi(tokenized)
++
++    def _embed(self, texts: List[str]):
++        return self.embedder.encode(texts, normalize_embeddings=True)
++
++    def query(self, question: str, top_k: Optional[int] = None) -> List[Dict[str, Any]]:
++        k = top_k or self.top_k
++
++        # Dense search
++        q_emb = self._embed([question])[0].tolist()
++        dense = self.collection.query(
++            query_embeddings=[q_emb],
++            n_results=max(k, 10),
++            include=["documents", "metadatas", "distances", "ids"],
++        )
++        dense_docs = []
++        for doc, meta, dist, id_ in zip(
++            dense.get("documents", [[]])[0],
++            dense.get("metadatas", [[]])[0],
++            dense.get("distances", [[]])[0],
++            dense.get("ids", [[]])[0],
++        ):
++            if doc is None:
++                continue
++            score = 1 - float(dist)  # cosine distance -> similarity
++            dense_docs.append({
++                "text": doc,
++                "source": (meta or {}).get("source"),
++                "page": (meta or {}).get("page"),
++                "score_dense": score,
++                "id": id_,
++            })
++        candidates = dense_docs
++
++        # Hybrid: RRF fuse dense + BM25
++        if self.hybrid and self.bm25 is not None and getattr(self, "_bm25_docs", []):
++            m = max(k, 10)
++            tokenized = question.split()
++            bm25_scores = self.bm25.get_scores(tokenized)
++            top_idx = np.argsort(bm25_scores)[::-1][:m]
++            bm25_docs = [{
++                "text": self._bm25_docs[idx],
++                "source": (self._bm25_metas[idx] or {}).get("source"),
++                "page": (self._bm25_metas[idx] or {}).get("page"),
++                "score_bm25": float(bm25_scores[idx]),
++                "id": self._bm25_ids[idx],
++            } for idx in top_idx]
++
++            def rrf(rank): return 1.0 / (60 + rank)
++            r = defaultdict(float); id2doc = {}
++            for i,d in enumerate(dense_docs): r[d["id"]] += rrf(i+1); id2doc[d["id"]] = d
++            for i,d in enumerate(bm25_docs): r[d["id"]] += rrf(i+1); id2doc.setdefault(d["id"], d)
++
++            fused = [{**id2doc[id_], "score_fused": float(score)} for id_, score in r.items()]
++            candidates = sorted(fused, key=lambda x: x["score_fused"], reverse=True)[:k]
++
++        # Optional rerank
++        if self.rerank and candidates:
++            from sentence_transformers import CrossEncoder
++            model = os.getenv("RERANK_MODEL", "cross-encoder/ms-marco-MiniLM-L-6-v2")
++            ce = CrossEncoder(model)
++            pairs = [[question, c["text"]] for c in candidates]
++            scores = ce.predict(pairs).tolist()
++            for c, s in zip(candidates, scores): c["score_rerank"] = float(s)
++            candidates = sorted(candidates, key=lambda x: x["score_rerank"], reverse=True)[:k]
++
++        out = []
++        for c in candidates[:k]:
++            score = c.get("score_rerank") or c.get("score_fused") or c.get("score_dense") or c.get("score_bm25") or 0.0
++            out.append({"text": c.get("text"), "source": c.get("source"), "page": c.get("page"), "score": float(score)})
++        return out
+diff --git a/app.py b/app.py
+index 0000000..5555555 100644
+--- a/app.py
++++ b/app.py
+@@ -1,120 +1,198 @@
+-# (old app)
++import os
++from typing import List, Dict, Any, Optional
++from fastapi import FastAPI
++from pydantic import BaseModel
++from dotenv import load_dotenv
++from retriever import ChromaRetriever
++
++load_dotenv()
++
++try:
++    from openai import OpenAI
++    _OPENAI_AVAILABLE = True
++except Exception:
++    _OPENAI_AVAILABLE = False
++
++app = FastAPI(title="RAG PDF Chatbot")
++
++class ChatRequest(BaseModel):
++    question: str
++    k: Optional[int] = None
++
++_retriever: Optional[ChromaRetriever] = None
++
++def get_retriever() -> ChromaRetriever:
++    global _retriever
++    if _retriever is None:
++        _retriever = ChromaRetriever()
++    return _retriever
++
++def _format_context(chunks: List[Dict[str, Any]]) -> str:
++    parts = []
++    for i, c in enumerate(chunks, 1):
++        src = c.get("source") or "unknown"
++        page = c.get("page")
++        head = f"[{i}] {src}" + (f" p.{page}" if page is not None else "")
++        text = (c.get("text") or "").strip()
++        parts.append(f"{head}\n{text}")
++    return "\n\n---\n\n".join(parts)
++
++def llm_answer(question: str, context: str) -> str:
++    api_key = os.getenv("OPENAI_API_KEY")
++    if not api_key or not _OPENAI_AVAILABLE:
++        return ("[Mock answer]\n"
++                "No OPENAI_API_KEY found; returning a template answer using only retrieved context. "
++                "Please set OPENAI_API_KEY to get real generations.")
++    client = OpenAI(api_key=api_key)
++    model = os.getenv("MODEL_NAME", "gpt-4.1-mini")
++    temperature = float(os.getenv("TEMPERATURE", "0.2"))
++    max_tokens = int(os.getenv("MAX_TOKENS", "350"))
++    system = ("You are a helpful assistant. Answer ONLY using the provided context. "
++              "Be concise and include inline citations like (source: file p.X). "
++              "If the answer cannot be found in the context, say you don't know.")
++    user = f"Question:\n{question}\n\nContext:\n{context}"
++    resp = client.chat.completions.create(
++        model=model,
++        messages=[{"role":"system","content":system},
++                  {"role":"user","content":user}],
++        temperature=temperature,
++        max_tokens=max_tokens,
++    )
++    return resp.choices[0].message.content
++
++@app.get("/healthz")
++def healthz():
++    try:
++        _ = get_retriever()
++        return {"ok": True}
++    except Exception as e:
++        return {"ok": False, "error": str(e)}
++
++@app.post("/ingest")
++def ingest():
++    return {"message": "Run `python ingest.py` to (re)build the vector store from data/pdfs."}
++
++@app.post("/chat")
++def chat(req: ChatRequest):
++    r = get_retriever()
++    docs = r.query(req.question, top_k=req.k)
++    context = _format_context(docs)
++    answer = llm_answer(req.question, context)
++    citations = [{"source": d.get("source"), "page": d.get("page"), "score": d.get("score")} for d in docs]
++    return {"answer": answer, "citations": citations, "retrieved": docs}
++
+diff --git a/streamlit_app.py b/streamlit_app.py
+new file mode 100644
+index 0000000..6666666 100644
+--- /dev/null
++++ b/streamlit_app.py
+@@ -0,0 +1,129 @@
++import os
++import json
++import httpx
++import streamlit as st
++
++API_BASE = os.getenv("RAG_API_BASE", "http://localhost:8000")
++
++st.set_page_config(page_title="RAG PDF Chatbot", layout="centered")
++st.title("📄🔎 RAG PDF Chatbot")
++st.caption("FastAPI backend + Chroma + SentenceTransformers + OpenAI (optional)")
++
++with st.sidebar:
++    st.header("Settings")
++    api_base = st.text_input("API base", API_BASE)
++    top_k = st.number_input("Top-K", min_value=1, max_value=20, value=5, step=1)
++    st.markdown("---")
++    st.markdown("**Backend health:**")
++    try:
++        r = httpx.get(f"{api_base}/healthz", timeout=5)
++        ok = r.json().get("ok", False)
++        st.success("Healthy" if ok else "Unhealthy")
++    except Exception as e:
++        st.error(f"Error: {e}")
++
++q = st.text_area("Ask a question about your PDFs:", height=120, placeholder="e.g., Summarize section 2 and cite pages.")
++if st.button("Ask", type="primary") and q.strip():
++    with st.spinner("Retrieving and generating..."):
++        try:
++            payload = {"question": q, "k": int(top_k)}
++            r = httpx.post(f"{api_base}/chat", json=payload, timeout=60)
++            r.raise_for_status()
++            data = r.json()
++            st.subheader("Answer")
++            st.write(data.get("answer", ""))
++            st.subheader("Citations")
++            cits = data.get("citations", [])
++            if not cits:
++                st.info("No citations returned.")
++            else:
++                for i, c in enumerate(cits, 1):
++                    st.write(f"[{i}] {c.get('source')} p.{c.get('page')} (score={c.get('score'):.3f})")
++            with st.expander("Retrieved Chunks"):
++                st.json(data.get("retrieved", []))
++        except Exception as e:
++            st.error(f"Request failed: {e}")
++
+diff --git a/eval.py b/eval.py
+new file mode 100644
+index 0000000..7777777 100644
+--- /dev/null
++++ b/eval.py
+@@ -0,0 +1,158 @@
++import csv
++import argparse
++from typing import List, Dict, Any
++from retriever import ChromaRetriever
++
++def precision_at_k(pred: List[Dict[str, Any]], gold_sources: List[str], k: int) -> float:
++    pred_sources = [ (d.get("source") or "").lower() for d in pred[:k] ]
++    gold = set([s.lower() for s in gold_sources if s])
++    if not gold:
++        return 0.0
++    hits = sum(1 for s in pred_sources if s in gold)
++    return hits / min(k, len(pred_sources) or 1)
++
++def mrr_at_k(pred: List[Dict[str, Any]], gold_sources: List[str], k: int) -> float:
++    gold = set([s.lower() for s in gold_sources if s])
++    for i, d in enumerate(pred[:k], 1):
++        if (d.get("source") or "").lower() in gold:
++            return 1.0 / i
++    return 0.0
++
++def main():
++    ap = argparse.ArgumentParser()
++    ap.add_argument("--csv", required=True, help="Path to eval/questions.csv")
++    ap.add_argument("--k", type=int, default=5)
++    args = ap.parse_args()
++
++    r = ChromaRetriever()
++    total = 0
++    p_at_k_sum = 0.0
++    mrr_sum = 0.0
++
++    rows = []
++    with open(args.csv, newline="", encoding="utf-8") as f:
++        for row in csv.DictReader(f):
++            rows.append(row)
++
++    for row in rows:
++        q = row["question"].strip()
++        gold_sources = [s.strip() for s in row["expected_sources"].split("|") if s.strip()]
++        docs = r.query(q, top_k=args.k)
++        p_at_k = precision_at_k(docs, gold_sources, args.k)
++        mrr = mrr_at_k(docs, gold_sources, args.k)
++        p_at_k_sum += p_at_k
++        mrr_sum += mrr
++        total += 1
++        print(f"Q{total}: P@{args.k}={p_at_k:.2f}  MRR@{args.k}={mrr:.2f}  | {q}")
++
++    if total:
++        print("-" * 60)
++        print(f"Avg P@{args.k}: {p_at_k_sum/total:.3f}")
++        print(f"Avg MRR@{args.k}: {mrr_sum/total:.3f}")
++    else:
++        print("No rows to evaluate.")
++
++if __name__ == "__main__":
++    main()
+diff --git a/eval/questions.csv b/eval/questions.csv
+new file mode 100644
+index 0000000..8888888 100644
+--- /dev/null
++++ b/eval/questions.csv
+@@ -0,0 +1,7 @@
++question,expected_sources
++"What is the main objective stated in the introduction?",doc1.pdf|intro.pdf
++"List the key definitions given in section 2",paperA.pdf
++"Summarize the methodology described for dataset preprocessing",thesis.pdf
++"What are the limitations discussed in the conclusion?",paperA.pdf|paperB.pdf
++"Provide the formula for metric X and cite the page",metrics.pdf
++"Outline the steps for experiment setup",thesis.pdf
+

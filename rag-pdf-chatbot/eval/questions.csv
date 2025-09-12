@@ -1,0 +1,7 @@
+question,expected_sources
+"What are two ways to improve retrieval quality?","sample.pdf"
+"State the chunk_size and chunk_overlap recommendations.","sample.pdf"
+"List evaluation metrics and latency targets.","sample.pdf"
+"Explain Reciprocal Rank Fusion in one line.","sample.pdf"
+"Which embedding normalization is suggested?","sample.pdf"
+"How should citations be presented?","sample.pdf"

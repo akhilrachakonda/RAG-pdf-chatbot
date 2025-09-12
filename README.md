@@ -36,6 +36,16 @@ python ingest.py
 uvicorn app:app --reload --port 8000
 ```
 
+## Done Checklist
+- Ingest PDFs (data/pdfs/) → Chroma (data/chroma/)
+- /chat answers with inline citations
+- OpenRouter provider (MODEL_NAME=deepseek/deepseek-r1) supported
+- /healthz and /metrics endpoints available
+- HYBRID and RERANK toggles validated, TOP_K chosen
+- Eval run saved in BENCHMARKS.md (P@3/MRR@3, latency p50/p95)
+- Docker image builds and runs with volume-mounted data/
+- .env not committed; keys rotated regularly
+
 ### Endpoints
 - `POST /ingest` -> (re)builds the Chroma index from `data/pdfs`.
 - `POST /chat` -> body: `{ "question": "..." }`
