@@ -1,8 +1,16 @@
 .env
 **/.env
 *.env
+
+# Virtual envs
+.venv/
 rag-pdf-chatbot/.venv/
+
+# Local data and indexes
 rag-pdf-chatbot/data/chroma/
+rag-pdf-chatbot/data/pdfs/
+
+# Caches and OS files
 __pycache__/
 .DS_Store
 *.log
